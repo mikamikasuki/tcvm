@@ -1,12 +1,8 @@
-use std::borrow::Cow;
-use std::ffi::OsStr;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::io::Write;
 use std::pin::Pin;
 
 use crate::Context;
+use crate::LoadError;
 use crate::builtin::util;
 use crate::dmm::{Collect, Trace};
 use crate::env::{
@@ -123,13 +119,14 @@ fn lua_dofile<'gc>(
     mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let fname = opt_string(ctx, &stack, 0, "dofile")?;
-    match load_file(ctx, fname, None, None) {
+    let path = fname.map(|f| f.as_bytes());
+    match ctx.load_file_with(path, None, Value::table(ctx.globals())) {
         Ok(f) => {
             stack.replace(&[Value::function(f)]);
             Ok(CallbackAction::call(None))
         }
-        Err(msg) => {
-            let msg = LuaString::new(ctx, msg.as_bytes());
+        Err(e) => {
+            let msg = LuaString::new(ctx, e.to_string().as_bytes());
             Err(Error::new(ctx, Value::string(msg)))
         }
     }
@@ -248,10 +245,10 @@ fn lua_load<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let chunk = to_lstring(ctx, stack.get(0));
     let mode = load_mode(ctx, &stack, 2, "load")?;
-    let env = stack.arg(3);
     if let Some(s) = chunk {
         let name = opt_string(ctx, &stack, 1, "load")?.unwrap_or(s);
-        let loaded = load_chunk(ctx, s.as_bytes(), name, mode, env);
+        let env = env_arg(ctx, &stack, 3);
+        let loaded = ctx.load_bytes(s.as_bytes(), name, mode.map(|m| m.as_bytes()), env);
         push_loaded(ctx, &mut stack, loaded);
         return Ok(CallbackAction::Return);
     }
@@ -259,7 +256,7 @@ fn lua_load<'gc>(
     let Some(reader) = stack.get(0).get_function() else {
         return Err(util::type_error(ctx, "load", 1, "function", stack.arg(0)));
     };
-    Ok(load_reader(ctx, reader, name, mode, env.is_some()))
+    Ok(load_reader(ctx, reader, name, mode))
 }
 
 /// `load` from a reader function, called until it returns nil or an empty
@@ -272,7 +269,6 @@ fn load_reader<'gc>(
     reader: Function<'gc>,
     name: Option<LuaString<'gc>>,
     mode: Option<LuaString<'gc>>,
-    has_env: bool,
 ) -> CallbackAction<'gc> {
     let seq = async_sequence(ctx.mutation(), |locals, mut seq| {
         let mc = ctx.mutation();
@@ -321,8 +317,8 @@ fn load_reader<'gc>(
                 let name = locals.fetch(mc, &name).get_string();
                 let name = name.unwrap_or_else(|| LuaString::new(ctx, b"=(load)"));
                 let mode = locals.fetch(mc, &mode).get_string();
-                let env = has_env.then(|| stack.get(3));
-                let loaded = load_chunk(ctx, &source, name, mode, env);
+                let env = env_arg(ctx, &stack, 3);
+                let loaded = ctx.load_bytes(&source, name, mode.map(|m| m.as_bytes()), env);
                 push_loaded(ctx, &mut stack, loaded);
             });
             Ok(SequenceReturn::Return)
@@ -331,46 +327,20 @@ fn load_reader<'gc>(
     CallbackAction::sequence(seq)
 }
 
-/// `luaL_loadbufferx`, then `load_aux`'s `env`: the chunk as a function, or
-/// the message to return after `nil`.
-fn load_chunk<'gc>(
-    ctx: Context<'gc>,
-    source: &[u8],
-    name: LuaString<'gc>,
-    mode: Option<LuaString<'gc>>,
-    env: Option<Value<'gc>>,
-) -> Result<Function<'gc>, String> {
-    let mode = mode.map_or(&b"bt"[..], |m| m.as_bytes());
-    // `LUA_SIGNATURE[0]`. There is no undump, so binary chunks always fail.
-    let binary = source.first() == Some(&0x1b);
-    let (kind, flag) = if binary {
-        ("binary", b'b')
-    } else {
-        ("text", b't')
-    };
-    if !mode.contains(&flag) {
-        let mode = String::from_utf8_lossy(mode);
-        return Err(format!("attempt to load a {kind} chunk (mode is '{mode}')"));
-    }
-    if binary {
-        return Err("binary chunks are not supported".into());
-    }
-    let Ok(source) = std::str::from_utf8(source) else {
-        return Err("chunk is not valid UTF-8".into());
-    };
-    let env = env.unwrap_or(Value::table(ctx.globals()));
-    ctx.load_chunk(source, name, env).map_err(|e| e.to_string())
+/// `load_aux`'s `env`: the argument at slot `i` when present, even nil.
+fn env_arg<'gc>(ctx: Context<'gc>, stack: &Stack<'gc, '_>, i: usize) -> Value<'gc> {
+    stack.arg(i).unwrap_or(Value::table(ctx.globals()))
 }
 
 fn push_loaded<'gc>(
     ctx: Context<'gc>,
     stack: &mut Stack<'gc, '_>,
-    loaded: Result<Function<'gc>, String>,
+    loaded: Result<Function<'gc>, LoadError>,
 ) {
     match loaded {
         Ok(f) => stack.ret1(Value::function(f)),
-        Err(msg) => {
-            let msg = LuaString::new(ctx, msg.as_bytes());
+        Err(e) => {
+            let msg = LuaString::new(ctx, e.to_string().as_bytes());
             stack.replace(&[Value::nil(), Value::string(msg)]);
         }
     }
@@ -431,56 +401,11 @@ fn lua_loadfile<'gc>(
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
     let fname = opt_string(ctx, &stack, 0, "loadfile")?;
     let mode = load_mode(ctx, &stack, 1, "loadfile")?;
-    let env = stack.arg(2);
-    let loaded = load_file(ctx, fname, mode, env);
+    let env = env_arg(ctx, &stack, 2);
+    let path = fname.map(|f| f.as_bytes());
+    let loaded = ctx.load_file_with(path, mode.map(|m| m.as_bytes()), env);
     push_loaded(ctx, &mut stack, loaded);
     Ok(CallbackAction::Return)
-}
-
-/// `luaL_loadfilex`, then [`load_chunk`]. A UTF-8 BOM and a first line
-/// starting with `#` are skipped; the line's newline stays for line numbers.
-fn load_file<'gc>(
-    ctx: Context<'gc>,
-    fname: Option<LuaString<'gc>>,
-    mode: Option<LuaString<'gc>>,
-    env: Option<Value<'gc>>,
-) -> Result<Function<'gc>, String> {
-    let mut contents = Vec::new();
-    let name = match fname {
-        Some(f) => {
-            let shown = String::from_utf8_lossy(f.as_bytes());
-            let path = Path::new(OsStr::from_bytes(f.as_bytes()));
-            let mut file = File::open(path)
-                .map_err(|e| format!("cannot open {shown}: {}", util::bare_io_msg(&e)))?;
-            // `luaL_loadfilex` clears `errno` before reporting a read error.
-            file.read_to_end(&mut contents)
-                .map_err(|_| format!("cannot read {shown}"))?;
-            [b"@", f.as_bytes()].concat()
-        }
-        None => {
-            std::io::stdin()
-                .read_to_end(&mut contents)
-                .map_err(|_| "cannot read stdin".to_string())?;
-            b"=stdin".to_vec()
-        }
-    };
-    let body = contents.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&contents);
-    let source = match body.strip_prefix(b"#") {
-        Some(line) => {
-            let rest = line
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(&[][..], |i| &line[i + 1..]);
-            // A binary chunk is read as is, without the newline.
-            if rest.first() == Some(&0x1b) {
-                Cow::Borrowed(rest)
-            } else {
-                Cow::Owned([b"\n", rest].concat())
-            }
-        }
-        None => Cow::Borrowed(body),
-    };
-    load_chunk(ctx, &source, LuaString::new(ctx, &name), mode, env)
 }
 
 /// `next(t [, k])` — `(k', t[k'])` for the entry after `k` in traversal

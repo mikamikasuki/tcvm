@@ -11,6 +11,12 @@ pub enum LoadError {
     /// `chunk` is the chunk id the message is prefixed with, as in Lua.
     #[error("{chunk}:{}: {}", .error.line_number, .error.kind)]
     Compile { chunk: String, error: CompileError },
+    /// The file couldn't be opened or read.
+    #[error("{0}")]
+    File(String),
+    /// Not loadable text: a binary chunk, not UTF-8, or excluded by the mode.
+    #[error("{0}")]
+    Chunk(String),
     #[error("internal: {0}")]
     Internal(&'static str),
 }

@@ -158,3 +158,37 @@ fn dofile_runs_and_raises() {
         format!("false cannot open {missing}: No such file or directory")
     );
 }
+
+#[test]
+fn host_load_file() {
+    let dir = dir_with(
+        "host",
+        &[
+            ("script.lua", b"#!/usr/bin/env tcvm\nreturn true\n"),
+            ("latin1.lua", b"return '\xFF'\n"),
+        ],
+    );
+    let mut lua = Lua::new();
+    let ex = lua
+        .try_enter(|ctx| -> Result<_, LoadError> {
+            let chunk = ctx.load_file(&dir.join("script.lua"))?;
+            Ok(ctx.stash(Executor::start(ctx, chunk, ())))
+        })
+        .expect("load");
+    assert!(lua.execute::<bool>(&ex).expect("run"));
+
+    let mut err = |name: &str| {
+        lua.enter(|ctx| match ctx.load_file(&dir.join(name)) {
+            Ok(_) => panic!("{name} loaded"),
+            Err(e) => e.to_string(),
+        })
+    };
+    assert_eq!(err("latin1.lua"), "chunk is not valid UTF-8");
+    assert_eq!(
+        err("missing.lua"),
+        format!(
+            "cannot open {}/missing.lua: No such file or directory",
+            dir.display()
+        )
+    );
+}

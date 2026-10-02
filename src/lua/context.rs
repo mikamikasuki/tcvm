@@ -1,5 +1,13 @@
+use std::borrow::Cow;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
 use cstree::build::NodeCache;
 
+use crate::builtin::util;
 use crate::compiler::compile_chunk;
 use crate::dmm::{DynamicRootSet, Gc, Mutation, RefLock};
 use crate::env::function::{Function, UpvalueState};
@@ -108,11 +116,96 @@ impl<'gc> Context<'gc> {
         // Like Lua's `load`, an unnamed chunk is named by its own text
         // (rendered as `[string "..."]` in messages).
         let name = LuaString::new(self, name.unwrap_or(source).as_bytes());
-        self.load_chunk(source, name, Value::table(self.state.globals))
+        self.load_text(source, name, Value::table(self.state.globals))
     }
 
-    /// [`load`](Self::load) with an explicit Lua chunk name and `_ENV`.
-    pub(crate) fn load_chunk(
+    /// Load the file at `path` as Lua's `loadfile` does: named `@path`, with
+    /// a UTF-8 BOM and a first line starting with `#` skipped.
+    pub fn load_file(self, path: &Path) -> Result<Function<'gc>, LoadError> {
+        let path = path.as_os_str().as_bytes();
+        self.load_file_with(Some(path), None, Value::table(self.state.globals))
+    }
+
+    /// `luaL_loadfilex`, reading stdin without a `path`, then
+    /// [`load_bytes`](Self::load_bytes). A skipped `#` line leaves its
+    /// newline, so line numbers hold.
+    pub(crate) fn load_file_with(
+        self,
+        path: Option<&[u8]>,
+        mode: Option<&[u8]>,
+        env: Value<'gc>,
+    ) -> Result<Function<'gc>, LoadError> {
+        let mut contents = Vec::new();
+        let name = match path {
+            Some(p) => {
+                let shown = String::from_utf8_lossy(p);
+                let mut file = File::open(Path::new(OsStr::from_bytes(p))).map_err(|e| {
+                    LoadError::File(format!("cannot open {shown}: {}", util::bare_io_msg(&e)))
+                })?;
+                // `luaL_loadfilex` clears `errno` before reporting a read error.
+                file.read_to_end(&mut contents)
+                    .map_err(|_| LoadError::File(format!("cannot read {shown}")))?;
+                [b"@", p].concat()
+            }
+            None => {
+                std::io::stdin()
+                    .read_to_end(&mut contents)
+                    .map_err(|_| LoadError::File("cannot read stdin".into()))?;
+                b"=stdin".to_vec()
+            }
+        };
+        let body = contents.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&contents);
+        let source = match body.strip_prefix(b"#") {
+            Some(line) => {
+                let rest = line
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(&[][..], |i| &line[i + 1..]);
+                // A binary chunk is read as is, without the newline.
+                if rest.first() == Some(&0x1b) {
+                    Cow::Borrowed(rest)
+                } else {
+                    Cow::Owned([b"\n", rest].concat())
+                }
+            }
+            None => Cow::Borrowed(body),
+        };
+        self.load_bytes(&source, LuaString::new(self, &name), mode, env)
+    }
+
+    /// `luaL_loadbufferx`, with `mode` as in Lua's `load` (default `bt`).
+    /// Only UTF-8 text loads: there is no undump for binary chunks.
+    pub(crate) fn load_bytes(
+        self,
+        source: &[u8],
+        name: LuaString<'gc>,
+        mode: Option<&[u8]>,
+        env: Value<'gc>,
+    ) -> Result<Function<'gc>, LoadError> {
+        let mode = mode.unwrap_or(b"bt");
+        // `LUA_SIGNATURE[0]`.
+        let binary = source.first() == Some(&0x1b);
+        let (kind, flag) = if binary {
+            ("binary", b'b')
+        } else {
+            ("text", b't')
+        };
+        if !mode.contains(&flag) {
+            let mode = String::from_utf8_lossy(mode);
+            return Err(LoadError::Chunk(format!(
+                "attempt to load a {kind} chunk (mode is '{mode}')"
+            )));
+        }
+        if binary {
+            return Err(LoadError::Chunk("binary chunks are not supported".into()));
+        }
+        let Ok(source) = std::str::from_utf8(source) else {
+            return Err(LoadError::Chunk("chunk is not valid UTF-8".into()));
+        };
+        self.load_text(source, name, env)
+    }
+
+    fn load_text(
         self,
         source: &str,
         name: LuaString<'gc>,
