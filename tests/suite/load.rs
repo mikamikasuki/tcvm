@@ -124,3 +124,15 @@ fn errors() {
         "nil chunk is not valid UTF-8"
     );
 }
+
+#[test]
+fn host_compile_error_names_the_chunk() {
+    let mut lua = Lua::new();
+    let msg = lua.enter(
+        |ctx| match ctx.load("local x <const> = 1\nx = 2", Some("=c")) {
+            Ok(_) => panic!("const assignment compiled"),
+            Err(e) => e.to_string(),
+        },
+    );
+    assert_eq!(msg, "c:2: attempt to assign to const variable 'x'");
+}

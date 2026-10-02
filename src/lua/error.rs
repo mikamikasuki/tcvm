@@ -8,8 +8,9 @@ pub enum LoadError {
     /// The rendered syntax error reports.
     #[error("{0}")]
     Parse(String),
-    #[error(transparent)]
-    Compile(#[from] CompileError),
+    /// `chunk` is the chunk id the message is prefixed with, as in Lua.
+    #[error("{chunk}:{}: {}", .error.line_number, .error.kind)]
+    Compile { chunk: String, error: CompileError },
     #[error("internal: {0}")]
     Internal(&'static str),
 }

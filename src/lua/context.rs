@@ -122,18 +122,23 @@ impl<'gc> Context<'gc> {
         let parse = parser::parse(&mut cache, source);
         // The parser only reports errors (see `State::report`), so any report
         // means the tree is unusable.
+        let chunk = || String::from_utf8_lossy(&chunk_id(name.as_bytes())).into_owned();
         if !parse.reports.is_empty() {
-            let id = chunk_id(name.as_bytes());
-            let id = String::from_utf8_lossy(&id);
             return Err(LoadError::Parse(parser::render_reports(
                 &parse.reports,
                 source,
-                &id,
+                &chunk(),
             )));
         }
         let root = parser::syntax::Root::new(parse.root)
             .ok_or(LoadError::Internal("parser did not produce a Root node"))?;
-        let proto = compile_chunk(self, &root, &parse.lines, cache.interner(), name)?;
+        let proto =
+            compile_chunk(self, &root, &parse.lines, cache.interner(), name).map_err(|error| {
+                LoadError::Compile {
+                    chunk: chunk(),
+                    error,
+                }
+            })?;
 
         // Main chunk's upvalue 0 is _ENV.
         let env_uv = Gc::new(self.mutation, RefLock::new(UpvalueState::Closed(env)));

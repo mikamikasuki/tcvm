@@ -7,14 +7,13 @@ use std::path::Path;
 use std::pin::Pin;
 
 use crate::Context;
-use crate::LoadError;
 use crate::builtin::util;
 use crate::dmm::{Collect, Trace};
 use crate::env::{
     Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
 };
 use crate::vm::async_sequence::{SequenceReturn, async_sequence};
-use crate::vm::debug::{chunk_id, where_prefix};
+use crate::vm::debug::where_prefix;
 use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
 };
@@ -360,18 +359,7 @@ fn load_chunk<'gc>(
         return Err("chunk is not valid UTF-8".into());
     };
     let env = env.unwrap_or(Value::table(ctx.globals()));
-    ctx.load_chunk(source, name, env).map_err(|e| match e {
-        LoadError::Compile(e) => {
-            let id = chunk_id(name.as_bytes());
-            format!(
-                "{}:{}: {}",
-                String::from_utf8_lossy(&id),
-                e.line_number,
-                e.kind
-            )
-        }
-        e => e.to_string(),
-    })
+    ctx.load_chunk(source, name, env).map_err(|e| e.to_string())
 }
 
 fn push_loaded<'gc>(
