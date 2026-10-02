@@ -510,6 +510,16 @@ fn index_error<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Error<'gc> {
     )
 }
 
+/// Bare `strerror(errno)` text for an error: Rust's `Display` appends
+/// " (os error N)", which Lua (using `strerror`) omits, so strip it.
+pub(crate) fn bare_io_msg(e: &std::io::Error) -> String {
+    let raw = e.to_string();
+    match raw.find(" (os error ") {
+        Some(cut) => raw[..cut].to_string(),
+        None => raw,
+    }
+}
+
 /// An error the VM itself would raise (`luaG_runerror`): raised from a native
 /// it carries no position, unlike `luaL_error`'s [`Error::from_str`].
 pub(crate) fn runtime_error<'gc>(ctx: Context<'gc>, msg: &str) -> Error<'gc> {

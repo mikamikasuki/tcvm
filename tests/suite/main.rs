@@ -22,6 +22,7 @@ mod goto_close;
 mod host_resume;
 mod io_library;
 mod load;
+mod loadfile;
 mod loop_close;
 mod main_yielded;
 mod math_fast_entries;

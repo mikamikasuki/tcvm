@@ -641,16 +641,6 @@ fn open_file<'gc>(
     ))
 }
 
-/// Bare `strerror(errno)` text for an error: Rust's `Display` appends
-/// " (os error N)", which Lua (using `strerror`) omits, so strip it.
-fn bare_io_msg(e: &std::io::Error) -> String {
-    let raw = e.to_string();
-    match raw.find(" (os error ") {
-        Some(cut) => raw[..cut].to_string(),
-        None => raw,
-    }
-}
-
 /// The l_checkmode regex `[rwa]\+?b*` — the only mode strings Lua's `io.open`
 /// accepts. An invalid mode is a raised argument error, not a file result.
 fn check_mode(mode: &[u8]) -> bool {
@@ -672,7 +662,7 @@ fn io_fail<'gc>(ctx: Context<'gc>, fname: Option<&str>, e: &std::io::Error) -> [
     // `luaL_fileresult`: the message is bare `strerror(errno)`, prefixed with
     // the *filename* only (never the operation name) and only when one is
     // available.
-    let bare = bare_io_msg(e);
+    let bare = util::bare_io_msg(e);
     let text = match fname {
         Some(f) => format!("{f}: {bare}"),
         None => bare,
@@ -836,7 +826,7 @@ fn default_file<'gc>(
                 let what = String::from_utf8_lossy(s.as_bytes());
                 Error::from_str(
                     ctx,
-                    &format!("cannot open file '{what}' ({})", bare_io_msg(&e)),
+                    &format!("cannot open file '{what}' ({})", util::bare_io_msg(&e)),
                 )
             })?
         } else {
@@ -864,7 +854,7 @@ fn lua_lines<'gc>(
                 let what = String::from_utf8_lossy(s.as_bytes());
                 Error::from_str(
                     ctx,
-                    &format!("cannot open file '{what}' ({})", bare_io_msg(&e)),
+                    &format!("cannot open file '{what}' ({})", util::bare_io_msg(&e)),
                 )
             })?;
             (Value::userdata(u), true, &stack.as_slice()[1..])

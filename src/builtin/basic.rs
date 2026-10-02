@@ -1,4 +1,9 @@
-use std::io::Write;
+use std::borrow::Cow;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::pin::Pin;
 
 use crate::Context;
@@ -111,12 +116,24 @@ fn lua_collectgarbage<'gc>(
     Ok(CallbackAction::Return)
 }
 
+/// `dofile([filename])` — run a file's chunk (stdin without a filename) and
+/// return its results. A load error is raised.
 fn lua_dofile<'gc>(
-    _ctx: Context<'gc>,
+    ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let fname = opt_string(ctx, &stack, 0, "dofile")?;
+    match load_file(ctx, fname, None, None) {
+        Ok(f) => {
+            stack.replace(&[Value::function(f)]);
+            Ok(CallbackAction::call(None))
+        }
+        Err(msg) => {
+            let msg = LuaString::new(ctx, msg.as_bytes());
+            Err(Error::new(ctx, Value::string(msg)))
+        }
+    }
 }
 
 /// `error(message [, level])`. The position prefix for `level >= 1` is
@@ -417,12 +434,65 @@ fn load_mode<'gc>(
     Ok(mode)
 }
 
+/// `loadfile([filename [, mode [, env]]])` — `load` for a file's contents
+/// (stdin without a filename).
 fn lua_loadfile<'gc>(
-    _ctx: Context<'gc>,
+    ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let fname = opt_string(ctx, &stack, 0, "loadfile")?;
+    let mode = load_mode(ctx, &stack, 1, "loadfile")?;
+    let env = stack.arg(2);
+    let loaded = load_file(ctx, fname, mode, env);
+    push_loaded(ctx, &mut stack, loaded);
+    Ok(CallbackAction::Return)
+}
+
+/// `luaL_loadfilex`, then [`load_chunk`]. A UTF-8 BOM and a first line
+/// starting with `#` are skipped; the line's newline stays for line numbers.
+fn load_file<'gc>(
+    ctx: Context<'gc>,
+    fname: Option<LuaString<'gc>>,
+    mode: Option<LuaString<'gc>>,
+    env: Option<Value<'gc>>,
+) -> Result<Function<'gc>, String> {
+    let mut contents = Vec::new();
+    let name = match fname {
+        Some(f) => {
+            let shown = String::from_utf8_lossy(f.as_bytes());
+            let path = Path::new(OsStr::from_bytes(f.as_bytes()));
+            let mut file = File::open(path)
+                .map_err(|e| format!("cannot open {shown}: {}", util::bare_io_msg(&e)))?;
+            // `luaL_loadfilex` clears `errno` before reporting a read error.
+            file.read_to_end(&mut contents)
+                .map_err(|_| format!("cannot read {shown}"))?;
+            [b"@", f.as_bytes()].concat()
+        }
+        None => {
+            std::io::stdin()
+                .read_to_end(&mut contents)
+                .map_err(|_| "cannot read stdin".to_string())?;
+            b"=stdin".to_vec()
+        }
+    };
+    let body = contents.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&contents);
+    let source = match body.strip_prefix(b"#") {
+        Some(line) => {
+            let rest = line
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(&[][..], |i| &line[i + 1..]);
+            // A binary chunk is read as is, without the newline.
+            if rest.first() == Some(&0x1b) {
+                Cow::Borrowed(rest)
+            } else {
+                Cow::Owned([b"\n", rest].concat())
+            }
+        }
+        None => Cow::Borrowed(body),
+    };
+    load_chunk(ctx, &source, LuaString::new(ctx, &name), mode, env)
 }
 
 /// `next(t [, k])` — `(k', t[k'])` for the entry after `k` in traversal
