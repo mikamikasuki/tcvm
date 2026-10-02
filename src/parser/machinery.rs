@@ -94,8 +94,13 @@ impl<'cache, 'source> State<'cache, 'source> {
         self.reports.push(error);
     }
 
+    /// Reports render as plain text (they end up in Lua error strings) and
+    /// index by byte, matching the lexer's spans.
     pub fn new_error(&self) -> ariadne::ReportBuilder<'static, Span> {
-        ariadne::Report::build(ariadne::ReportKind::Error, self.span())
+        let config = ariadne::Config::default()
+            .with_color(false)
+            .with_index_type(ariadne::IndexType::Byte);
+        ariadne::Report::build(ariadne::ReportKind::Error, self.span()).with_config(config)
     }
 
     pub fn new_label(&self) -> ariadne::Label<Span> {

@@ -22,6 +22,45 @@ pub fn parse(cache: &mut NodeCache<'static>, source: &str) -> Parse {
     Parser::new(cache, source).run()
 }
 
+/// Render `reports` against `source`, which is labelled `name` (a chunk id
+/// such as `[string "..."]`).
+pub(crate) fn render_reports(
+    reports: &[ariadne::Report<'static, Span>],
+    source: &str,
+    name: &str,
+) -> String {
+    struct Chunk<'a> {
+        name: &'a str,
+        source: ariadne::Source<&'a str>,
+    }
+
+    impl<'a> ariadne::Cache<()> for Chunk<'a> {
+        type Storage = &'a str;
+
+        fn fetch(&mut self, _: &()) -> Result<&ariadne::Source<&'a str>, impl std::fmt::Debug> {
+            Ok::<_, std::convert::Infallible>(&self.source)
+        }
+
+        fn display<'b>(&self, _: &'b ()) -> Option<impl std::fmt::Display + 'b> {
+            Some(self.name.to_owned())
+        }
+    }
+
+    let mut chunk = Chunk {
+        name,
+        source: ariadne::Source::from(source),
+    };
+    let mut out = Vec::new();
+    for report in reports {
+        report
+            .write(&mut chunk, &mut out)
+            .expect("writing to a Vec cannot fail");
+    }
+    let mut out = String::from_utf8(out).expect("ariadne writes UTF-8");
+    out.truncate(out.trim_end().len());
+    out
+}
+
 struct Parser<'cache, 'source> {
     state: State<'cache, 'source>,
 }

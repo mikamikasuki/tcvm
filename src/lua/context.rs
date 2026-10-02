@@ -9,6 +9,7 @@ use crate::env::{LuaString, Symbols, Table, Value};
 use crate::lua::stash::{Fetchable, Stashable};
 use crate::lua::{LoadError, State};
 use crate::parser;
+use crate::vm::debug::chunk_id;
 
 /// Cheap, copy handle into the arena mutation context.
 #[derive(Copy, Clone)]
@@ -104,25 +105,38 @@ impl<'gc> Context<'gc> {
     /// Parse and compile `source` into a `Function`, with `_ENV` bound to the
     /// runtime's globals table.
     pub fn load(self, source: &str, name: Option<&str>) -> Result<Function<'gc>, LoadError> {
+        // Like Lua's `load`, an unnamed chunk is named by its own text
+        // (rendered as `[string "..."]` in messages).
+        let name = LuaString::new(self, name.unwrap_or(source).as_bytes());
+        self.load_chunk(source, name, Value::table(self.state.globals))
+    }
+
+    /// [`load`](Self::load) with an explicit Lua chunk name and `_ENV`.
+    pub(crate) fn load_chunk(
+        self,
+        source: &str,
+        name: LuaString<'gc>,
+        env: Value<'gc>,
+    ) -> Result<Function<'gc>, LoadError> {
         let mut cache = NodeCache::new();
         let parse = parser::parse(&mut cache, source);
         // The parser only reports errors (see `State::report`), so any report
         // means the tree is unusable.
         if !parse.reports.is_empty() {
-            return Err(LoadError::Parse(parse.reports));
+            let id = chunk_id(name.as_bytes());
+            let id = String::from_utf8_lossy(&id);
+            return Err(LoadError::Parse(parser::render_reports(
+                &parse.reports,
+                source,
+                &id,
+            )));
         }
         let root = parser::syntax::Root::new(parse.root)
             .ok_or(LoadError::Internal("parser did not produce a Root node"))?;
-        // Like Lua's `load`, an unnamed chunk is named by its own text
-        // (rendered as `[string "..."]` in messages).
-        let name = LuaString::new(self, name.unwrap_or(source).as_bytes());
         let proto = compile_chunk(self, &root, &parse.lines, cache.interner(), name)?;
 
-        // Main chunk's upvalue 0 is _ENV. Pre-close it onto globals.
-        let env_uv = Gc::new(
-            self.mutation,
-            RefLock::new(UpvalueState::Closed(Value::table(self.state.globals))),
-        );
+        // Main chunk's upvalue 0 is _ENV.
+        let env_uv = Gc::new(self.mutation, RefLock::new(UpvalueState::Closed(env)));
         let mut upvalues = Vec::with_capacity_in(
             1,
             crate::dmm::allocator_api::MetricsAlloc::new(self.mutation),

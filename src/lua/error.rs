@@ -1,14 +1,13 @@
-use ariadne::Report;
 use thiserror::Error;
 
 use crate::compiler::CompileError;
 use crate::lua::stash::StashedError;
-use crate::parser::machinery::Span;
 
 #[derive(Debug, Error)]
 pub enum LoadError {
-    #[error("parse error")]
-    Parse(Vec<Report<'static, Span>>),
+    /// The rendered syntax error reports.
+    #[error("{0}")]
+    Parse(String),
     #[error(transparent)]
     Compile(#[from] CompileError),
     #[error("internal: {0}")]

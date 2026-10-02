@@ -21,6 +21,7 @@ mod generic_for;
 mod goto_close;
 mod host_resume;
 mod io_library;
+mod load;
 mod loop_close;
 mod main_yielded;
 mod math_fast_entries;

@@ -2,12 +2,14 @@ use std::io::Write;
 use std::pin::Pin;
 
 use crate::Context;
+use crate::LoadError;
 use crate::builtin::util;
 use crate::dmm::{Collect, Trace};
 use crate::env::{
     Error, Function, LuaString, MetamethodBits, NativeClosure, NativeFn, Stack, Value,
 };
 use crate::vm::async_sequence::{SequenceReturn, async_sequence};
+use crate::vm::debug::{chunk_id, where_prefix};
 use crate::vm::sequence::{
     BoxSequence, CallbackAction, Catch, Execution, Sequence, SequencePoll, seq_trace_pointers,
 };
@@ -220,12 +222,199 @@ fn ipairs_meta<'gc>(ctx: Context<'gc>, i: i64) -> CallbackAction<'gc> {
     CallbackAction::sequence(seq)
 }
 
+/// `load(chunk [, chunkname [, mode [, env]]])` — compile a string chunk, or
+/// the pieces a reader function returns, into a function; `(nil, message)`
+/// when that fails.
 fn lua_load<'gc>(
-    _ctx: Context<'gc>,
+    ctx: Context<'gc>,
     _closure: &NativeClosure<'gc>,
-    _stack: Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<CallbackAction<'gc>, Error<'gc>> {
-    todo!()
+    let chunk = to_lstring(ctx, stack.get(0));
+    let mode = load_mode(ctx, &stack, 2, "load")?;
+    let env = stack.arg(3);
+    if let Some(s) = chunk {
+        let name = opt_string(ctx, &stack, 1, "load")?.unwrap_or(s);
+        let loaded = load_chunk(ctx, s.as_bytes(), name, mode, env);
+        push_loaded(ctx, &mut stack, loaded);
+        return Ok(CallbackAction::Return);
+    }
+    let name = opt_string(ctx, &stack, 1, "load")?;
+    let Some(reader) = stack.get(0).get_function() else {
+        return Err(util::type_error(ctx, "load", 1, "function", stack.arg(0)));
+    };
+    Ok(load_reader(ctx, reader, name, mode, env.is_some()))
+}
+
+/// `load` from a reader function, called until it returns nil or an empty
+/// string. An error the reader raises becomes `load`'s `(nil, message)`.
+/// Unlike Lua, which parses as it reads, the whole chunk is read first.
+#[cold]
+#[inline(never)]
+fn load_reader<'gc>(
+    ctx: Context<'gc>,
+    reader: Function<'gc>,
+    name: Option<LuaString<'gc>>,
+    mode: Option<LuaString<'gc>>,
+    has_env: bool,
+) -> CallbackAction<'gc> {
+    let seq = async_sequence(ctx.mutation(), |locals, mut seq| {
+        let mc = ctx.mutation();
+        let reader = locals.stash(mc, reader);
+        let name = locals.stash(mc, name.map_or(Value::nil(), Value::string));
+        let mode = locals.stash(mc, mode.map_or(Value::nil(), Value::string));
+        async move {
+            let mut source = Vec::new();
+            loop {
+                let bottom = seq.enter(|_ctx, _locals, _exec, stack| stack.len());
+                if let Err(e) = seq.call(&reader, bottom).await {
+                    seq.enter(|ctx, locals, _exec, mut stack| {
+                        let e = locals.fetch(ctx.mutation(), &e);
+                        stack.replace(&[Value::nil(), e.value()]);
+                    });
+                    return Ok(SequenceReturn::Return);
+                }
+                // `Some(done)`, or `None` for a piece that isn't a string.
+                let piece = seq.enter(|ctx, _locals, _exec, mut stack| {
+                    let v = stack.get(bottom);
+                    stack.truncate(bottom);
+                    if v.is_nil() {
+                        return Some(true);
+                    }
+                    let s = to_lstring(ctx, v)?;
+                    source.extend_from_slice(s.as_bytes());
+                    Some(s.is_empty())
+                });
+                match piece {
+                    Some(false) => {}
+                    Some(true) => break,
+                    None => {
+                        seq.enter(|ctx, _locals, _exec, mut stack| {
+                            // `luaL_error`, located at `load`'s caller.
+                            let mut msg = where_prefix(stack.thread_mut(), 1);
+                            msg.extend_from_slice(b"reader function must return a string");
+                            let msg = LuaString::new(ctx, &msg);
+                            stack.replace(&[Value::nil(), Value::string(msg)]);
+                        });
+                        return Ok(SequenceReturn::Return);
+                    }
+                }
+            }
+            seq.enter(|ctx, locals, _exec, mut stack| {
+                let mc = ctx.mutation();
+                let name = locals.fetch(mc, &name).get_string();
+                let name = name.unwrap_or_else(|| LuaString::new(ctx, b"=(load)"));
+                let mode = locals.fetch(mc, &mode).get_string();
+                let env = has_env.then(|| stack.get(3));
+                let loaded = load_chunk(ctx, &source, name, mode, env);
+                push_loaded(ctx, &mut stack, loaded);
+            });
+            Ok(SequenceReturn::Return)
+        }
+    });
+    CallbackAction::sequence(seq)
+}
+
+/// `luaL_loadbufferx`, then `load_aux`'s `env`: the chunk as a function, or
+/// the message to return after `nil`.
+fn load_chunk<'gc>(
+    ctx: Context<'gc>,
+    source: &[u8],
+    name: LuaString<'gc>,
+    mode: Option<LuaString<'gc>>,
+    env: Option<Value<'gc>>,
+) -> Result<Function<'gc>, String> {
+    let mode = mode.map_or(&b"bt"[..], |m| m.as_bytes());
+    // `LUA_SIGNATURE[0]`. There is no undump, so binary chunks always fail.
+    let binary = source.first() == Some(&0x1b);
+    let (kind, flag) = if binary {
+        ("binary", b'b')
+    } else {
+        ("text", b't')
+    };
+    if !mode.contains(&flag) {
+        let mode = String::from_utf8_lossy(mode);
+        return Err(format!("attempt to load a {kind} chunk (mode is '{mode}')"));
+    }
+    if binary {
+        return Err("binary chunks are not supported".into());
+    }
+    let Ok(source) = std::str::from_utf8(source) else {
+        return Err("chunk is not valid UTF-8".into());
+    };
+    let env = env.unwrap_or(Value::table(ctx.globals()));
+    ctx.load_chunk(source, name, env).map_err(|e| match e {
+        LoadError::Compile(e) => {
+            let id = chunk_id(name.as_bytes());
+            format!(
+                "{}:{}: {}",
+                String::from_utf8_lossy(&id),
+                e.line_number,
+                e.kind
+            )
+        }
+        e => e.to_string(),
+    })
+}
+
+fn push_loaded<'gc>(
+    ctx: Context<'gc>,
+    stack: &mut Stack<'gc, '_>,
+    loaded: Result<Function<'gc>, String>,
+) {
+    match loaded {
+        Ok(f) => stack.ret1(Value::function(f)),
+        Err(msg) => {
+            let msg = LuaString::new(ctx, msg.as_bytes());
+            stack.replace(&[Value::nil(), Value::string(msg)]);
+        }
+    }
+}
+
+/// `lua_tolstring` without metamethods: strings, and numbers converted.
+fn to_lstring<'gc>(ctx: Context<'gc>, v: Value<'gc>) -> Option<LuaString<'gc>> {
+    if let Some(s) = v.get_string() {
+        Some(s)
+    } else if v.get_integer().is_some() || v.get_float().is_some() {
+        Some(util::basic_tostring(ctx, v))
+    } else {
+        None
+    }
+}
+
+/// `luaL_optstring` for argument slot `i`.
+fn opt_string<'gc>(
+    ctx: Context<'gc>,
+    stack: &Stack<'gc, '_>,
+    i: usize,
+    fname: &str,
+) -> Result<Option<LuaString<'gc>>, Error<'gc>> {
+    let v = stack.get(i);
+    if v.is_nil() {
+        return Ok(None);
+    }
+    match to_lstring(ctx, v) {
+        Some(s) => Ok(Some(s)),
+        None => Err(util::type_error(ctx, fname, i + 1, "string", Some(v))),
+    }
+}
+
+/// `getMode`: the optional mode at slot `i`. `B` (fixed buffers) is only for
+/// the C API.
+fn load_mode<'gc>(
+    ctx: Context<'gc>,
+    stack: &Stack<'gc, '_>,
+    i: usize,
+    fname: &str,
+) -> Result<Option<LuaString<'gc>>, Error<'gc>> {
+    let mode = opt_string(ctx, stack, i, fname)?;
+    if mode.is_some_and(|m| m.as_bytes().contains(&b'B')) {
+        return Err(Error::from_str(
+            ctx,
+            &format!("bad argument #{} to '{fname}' (invalid mode)", i + 1),
+        ));
+    }
+    Ok(mode)
 }
 
 fn lua_loadfile<'gc>(
